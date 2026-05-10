@@ -1,0 +1,825 @@
+---
+title: "Final Project DATA607 - Beyond Magnitude: Analyzing Earthquake Risk Through Seismic Activity and Population Exposure"
+author: "Muhammad Suffyan Khan"
+date: "05/09/2026"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    embed-resources: true
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# 1. Executive Summary
+
+This project analyzes earthquake risk by combining two different types of data sources: earthquake event data from the USGS Earthquake Catalog API/GeoJSON source and country-level population data from the World Bank Population, total (`SP.POP.TOTL`) CSV dataset. The main idea is that earthquake risk should not be interpreted only through magnitude or event counts. A more useful risk view should also consider how many people may be exposed in affected countries or regions.
+
+The workflow follows a reproducible data science process: acquire data, clean and transform the raw records, create useful features, join earthquake activity with population exposure, conduct exploratory and statistical analysis, build a custom exposure scoring system, and present findings through visualizations and interpretation. The project uses geospatial mapping with `leaflet` and a custom earthquake exposure score as features beyond the standard class workflow.
+
+# 2. Introduction and Motivation
+
+Earthquakes are often discussed in terms of magnitude, but magnitude alone does not fully describe risk. A strong earthquake in a remote area may expose fewer people than a moderate earthquake near a highly populated region. For this reason, this project combines seismic activity with population data to examine earthquake exposure from a broader data science perspective.
+
+The goal is to answer the following question:
+
+**Which countries or regions appear most exposed when earthquake activity is combined with population size, and does this change how earthquake risk is interpreted compared with magnitude or event count alone?**
+
+# 3. Research Questions
+
+This analysis is guided by four research questions:
+
+1.  Which countries or regions experienced the highest number of earthquakes during the study period?
+2.  Which countries or regions had the highest earthquake activity after adjusting for population size?
+3.  How do magnitude, depth, event frequency, and population combine into an exposure-based risk ranking?
+4.  Does the custom exposure score provide a different interpretation than earthquake count alone?
+
+# 4. Data Sources
+
+## 4.1 USGS Earthquake Catalog API
+
+The first data source is the USGS Earthquake Catalog API. The project uses a GeoJSON query to retrieve earthquake events with information such as event time, magnitude, depth, latitude, longitude, place description, tsunami flag, and event significance.
+
+For this project, the study period is limited to one full year to keep the scope manageable and reproducible. The analysis uses earthquakes with magnitude 4.5 or greater because these events are more likely to be meaningful for regional exposure analysis and reduce noise from very small events.
+
+## 4.2 World Bank Population CSV
+
+The second data source is the World Bank Population, total indicator (`SP.POP.TOTL`). The raw CSV file is stored in the GitHub repository and loaded through a raw GitHub URL. The World Bank dataset contains yearly population values by country.
+
+## 4.3 Why These Sources Work Together
+
+The USGS data captures seismic activity, while the World Bank data captures country-level population exposure. Combining these sources allows the project to compare earthquake activity alone with population-adjusted and exposure-weighted metrics.
+
+# 5. Data Science Workflow
+
+The project follows this workflow:
+
+1.  **Acquire** earthquake data from the USGS API and population data from the World Bank CSV.
+2.  **Clean** event records, timestamps, magnitude values, depth values, and country identifiers.
+3.  **Transform** earthquake timestamps into dates, classify magnitudes and depths, reshape population data from wide to long format, and select the latest available population year.
+4.  **Join** earthquake records with country boundaries and population data.
+5.  **Analyze** event frequency, magnitude distribution, population-adjusted rates, and custom exposure scores.
+6.  **Visualize** earthquake patterns using bar charts, scatterplots, and an interactive map.
+7.  **Conclude** which countries or regions appear most exposed and discuss limitations.
+
+# 6. Loading Libraries
+
+```{r setup}
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(scales)
+library(sf)
+library(rnaturalearth)
+library(leaflet)
+library(broom)
+library(knitr)
+library(htmltools)
+library(viridis)
+
+options(scipen = 999)
+```
+
+# 7. Data Acquisition
+
+## 7.1 Load USGS Earthquake Data
+
+This section pulls earthquake event records from the USGS Earthquake Catalog API. The query uses GeoJSON format, a one-year study period, and a minimum magnitude of 4.5.
+
+```{r usgs-data-acquisition}
+study_start <- "2025-01-01"
+study_end <- "2025-12-31"
+minimum_magnitude <- 4.5
+
+usgs_url <- paste0(
+  "https://earthquake.usgs.gov/fdsnws/event/1/query?",
+  "format=geojson",
+  "&starttime=", study_start,
+  "&endtime=", study_end,
+  "&minmagnitude=", minimum_magnitude,
+  "&orderby=time"
+)
+
+earthquake_json <- jsonlite::fromJSON(usgs_url, flatten = TRUE)
+
+earthquake_features <- earthquake_json$features
+
+coordinate_tbl <- tibble(
+  longitude = purrr::map_dbl(earthquake_features$geometry.coordinates, 1),
+  latitude = purrr::map_dbl(earthquake_features$geometry.coordinates, 2),
+  depth_km = purrr::map_dbl(earthquake_features$geometry.coordinates, 3)
+)
+
+earthquakes_raw <- earthquake_features %>%
+  as_tibble() %>%
+  bind_cols(coordinate_tbl) %>%
+  transmute(
+    event_id = id,
+    magnitude = properties.mag,
+    place = properties.place,
+    event_time_utc = lubridate::as_datetime(properties.time / 1000, tz = "UTC"),
+    updated_time_utc = lubridate::as_datetime(properties.updated / 1000, tz = "UTC"),
+    tsunami = properties.tsunami,
+    significance = properties.sig,
+    status = properties.status,
+    alert = properties.alert,
+    event_url = properties.url,
+    longitude,
+    latitude,
+    depth_km
+  )
+
+knitr::kable(
+  head(earthquakes_raw, 10),
+  caption = "Sample of raw earthquake events from the USGS API"
+)
+```
+
+The USGS API data is now in a tidy format with one row per earthquake event. The longitude, latitude, and depth values were extracted from the nested GeoJSON coordinate field.
+
+## 7.2 Load World Bank Population Data
+
+The World Bank file has metadata rows before the actual table begins, so the code skips the first four rows. This keeps the raw file unchanged while making the analysis reproducible.
+
+```{r world-bank-data-acquisition}
+population_url <- "https://raw.githubusercontent.com/suffyankhan77/Final_Project-DATA-607/refs/heads/main/data/raw/API_SP.POP.TOTL_DS2_en_csv_v2_127039.csv"
+country_metadata_url <- "https://raw.githubusercontent.com/suffyankhan77/Final_Project-DATA-607/refs/heads/main/data/raw/Metadata_Country_API_SP.POP.TOTL_DS2_en_csv_v2_127039.csv"
+indicator_metadata_url <- "https://raw.githubusercontent.com/suffyankhan77/Final_Project-DATA-607/refs/heads/main/data/raw/Metadata_Indicator_API_SP.POP.TOTL_DS2_en_csv_v2_127039.csv"
+
+population_raw <- readr::read_csv(
+  population_url,
+  skip = 4,
+  show_col_types = FALSE
+) %>%
+  select(-starts_with("Unnamed"))
+
+country_metadata <- readr::read_csv(
+  country_metadata_url,
+  show_col_types = FALSE
+) %>%
+  select(-starts_with("Unnamed"))
+
+indicator_metadata <- readr::read_csv(
+  indicator_metadata_url,
+  show_col_types = FALSE
+) %>%
+  select(-starts_with("Unnamed"))
+
+knitr::kable(
+  head(population_raw, 8),
+  caption = "Sample of raw World Bank population data"
+)
+```
+
+# 8. Data Cleaning and Transformation
+
+## 8.1 Clean Earthquake Records
+
+This section converts timestamps into useful date fields and creates magnitude and depth categories. These transformations support both descriptive analysis and later exposure scoring.
+
+```{r clean-earthquakes}
+earthquakes_clean <- earthquakes_raw %>%
+  filter(
+    !is.na(magnitude),
+    !is.na(latitude),
+    !is.na(longitude),
+    !is.na(depth_km)
+  ) %>%
+  mutate(
+    event_date = as.Date(event_time_utc),
+    event_year = lubridate::year(event_time_utc),
+    event_month = lubridate::month(event_time_utc, label = TRUE, abbr = TRUE),
+    magnitude_category = case_when(
+      magnitude < 5.0 ~ "Light: 4.5-4.9",
+      magnitude < 6.0 ~ "Moderate: 5.0-5.9",
+      magnitude < 7.0 ~ "Strong: 6.0-6.9",
+      TRUE ~ "Major/Great: 7.0+"
+    ),
+    magnitude_category = factor(
+      magnitude_category,
+      levels = c(
+        "Light: 4.5-4.9",
+        "Moderate: 5.0-5.9",
+        "Strong: 6.0-6.9",
+        "Major/Great: 7.0+"
+      )
+    ),
+    depth_category = case_when(
+      depth_km < 70 ~ "Shallow: <70 km",
+      depth_km < 300 ~ "Intermediate: 70-299 km",
+      TRUE ~ "Deep: 300+ km"
+    ),
+    depth_category = factor(
+      depth_category,
+      levels = c("Shallow: <70 km", "Intermediate: 70-299 km", "Deep: 300+ km")
+    ),
+    magnitude_weight = case_when(
+      magnitude < 5.0 ~ 1,
+      magnitude < 6.0 ~ 2,
+      magnitude < 7.0 ~ 4,
+      TRUE ~ 8
+    ),
+    depth_weight = case_when(
+      depth_km < 70 ~ 1.20,
+      depth_km < 300 ~ 1.00,
+      TRUE ~ 0.80
+    ),
+    event_weight = magnitude_weight * depth_weight
+  )
+
+knitr::kable(
+  earthquakes_clean %>%
+    select(event_id, event_date, magnitude, magnitude_category, depth_km, depth_category, event_weight, place) %>%
+    head(10),
+  caption = "Cleaned earthquake records with magnitude and depth categories"
+)
+```
+
+## 8.2 Convert Earthquake Points to Spatial Data
+
+To connect earthquakes with countries, the latitude and longitude values are converted into spatial point features. Natural Earth country boundaries are then used to assign country and continent information to each event.
+
+```{r spatial-country-join}
+world_countries <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") %>%
+  sf::st_make_valid() %>%
+  select(
+    country = admin,
+    iso_a3,
+    continent,
+    geometry
+  )
+
+earthquake_points <- earthquakes_clean %>%
+  sf::st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+earthquakes_with_country <- sf::st_join(
+  earthquake_points,
+  world_countries,
+  join = sf::st_within,
+  left = TRUE
+) %>%
+  sf::st_drop_geometry()
+
+country_match_summary <- earthquakes_with_country %>%
+  summarise(
+    total_events = n(),
+    matched_to_country = sum(!is.na(iso_a3)),
+    unmatched_or_ocean_events = sum(is.na(iso_a3)),
+    matched_percent = matched_to_country / total_events
+  )
+
+knitr::kable(
+  country_match_summary,
+  digits = 3,
+  caption = "Summary of earthquake events matched to country boundaries"
+)
+```
+
+Some earthquake events occur offshore or in oceanic regions, so they may not fall within a country boundary. These events are retained for global descriptive analysis but excluded from country-level population joins.
+
+## 8.3 Clean and Reshape World Bank Population Data
+
+The World Bank population dataset is originally wide, with one column for each year. This section transforms it into a tidy long format and selects the latest available population year.
+
+```{r clean-population}
+population_long <- population_raw %>%
+  select(
+    country_name_wb = `Country Name`,
+    iso_a3 = `Country Code`,
+    indicator_name = `Indicator Name`,
+    indicator_code = `Indicator Code`,
+    matches("^\\d{4}$")
+  ) %>%
+  pivot_longer(
+    cols = matches("^\\d{4}$"),
+    names_to = "population_year",
+    values_to = "population"
+  ) %>%
+  mutate(
+    population_year = as.integer(population_year),
+    population = as.numeric(population)
+  )
+
+latest_population_year <- population_long %>%
+  filter(!is.na(population)) %>%
+  summarise(latest_year = max(population_year)) %>%
+  pull(latest_year)
+
+population_latest <- population_long %>%
+  filter(population_year == latest_population_year) %>%
+  filter(!is.na(population)) %>%
+  select(iso_a3, country_name_wb, population_year, population)
+
+country_metadata_clean <- country_metadata %>%
+  transmute(
+    iso_a3 = `Country Code`,
+    wb_region = Region,
+    income_group = IncomeGroup,
+    table_name = TableName
+  )
+
+population_latest <- population_latest %>%
+  left_join(country_metadata_clean, by = "iso_a3") %>%
+  filter(!is.na(wb_region), wb_region != "Aggregates")
+
+knitr::kable(
+  head(population_latest, 10),
+  caption = paste("Cleaned World Bank population data for latest available year:", latest_population_year)
+)
+```
+
+This transformation satisfies the requirement for data reshaping because the World Bank population data is converted from a wide year-based format into a tidy long format before the latest year is selected.
+
+# 9. Joined Country-Level Analysis Dataset
+
+This section aggregates earthquake activity by country and joins it with population data. Several exposure metrics are created, including earthquakes per million people, weighted activity per million people, and a custom exposure index.
+
+```{r country-level-dataset}
+earthquake_country_summary <- earthquakes_with_country %>%
+  filter(!is.na(iso_a3)) %>%
+  group_by(iso_a3, country, continent) %>%
+  summarise(
+    earthquake_count = n(),
+    avg_magnitude = mean(magnitude, na.rm = TRUE),
+    max_magnitude = max(magnitude, na.rm = TRUE),
+    avg_depth_km = mean(depth_km, na.rm = TRUE),
+    shallow_event_count = sum(depth_category == "Shallow: <70 km", na.rm = TRUE),
+    strong_or_major_count = sum(magnitude >= 6.0, na.rm = TRUE),
+    major_event_count = sum(magnitude >= 7.0, na.rm = TRUE),
+    weighted_seismic_activity = sum(event_weight, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+country_exposure <- earthquake_country_summary %>%
+  left_join(population_latest, by = "iso_a3") %>%
+  filter(!is.na(population), population > 0) %>%
+  mutate(
+    population_millions = population / 1000000,
+    earthquakes_per_million = earthquake_count / population_millions,
+    weighted_activity_per_million = weighted_seismic_activity / population_millions,
+    population_exposure_factor = log10(population),
+    raw_exposure_index = weighted_seismic_activity * population_exposure_factor,
+    exposure_score_0_100 = scales::rescale(raw_exposure_index, to = c(0, 100))
+  ) %>%
+  arrange(desc(exposure_score_0_100))
+
+knitr::kable(
+  country_exposure %>%
+    select(
+      country, continent, population_year, population_millions, earthquake_count,
+      max_magnitude, weighted_seismic_activity, earthquakes_per_million,
+      exposure_score_0_100
+    ) %>%
+    head(15),
+  digits = 2,
+  caption = "Top 15 countries by custom earthquake exposure score"
+)
+```
+
+The custom exposure score combines weighted seismic activity with a population exposure factor. The score is scaled from 0 to 100 so countries can be compared more easily. This is not a measure of actual damage or loss; it is an analytical index designed to compare relative exposure based on available data.
+
+# 10. Exploratory Data Analysis
+
+## 10.1 Overall Earthquake Summary
+
+```{r overall-summary}
+overall_summary <- earthquakes_clean %>%
+  summarise(
+    study_start = min(event_date),
+    study_end = max(event_date),
+    total_events = n(),
+    average_magnitude = mean(magnitude),
+    median_magnitude = median(magnitude),
+    maximum_magnitude = max(magnitude),
+    average_depth_km = mean(depth_km),
+    median_depth_km = median(depth_km)
+  )
+
+knitr::kable(
+  overall_summary,
+  digits = 2,
+  caption = "Overall earthquake summary for the study period"
+)
+```
+
+## 10.2 Earthquakes by Magnitude Category
+
+```{r magnitude-category-summary}
+magnitude_category_summary <- earthquakes_clean %>%
+  count(magnitude_category, name = "event_count") %>%
+  mutate(percent = event_count / sum(event_count))
+
+knitr::kable(
+  magnitude_category_summary,
+  digits = 3,
+  caption = "Earthquake count by magnitude category"
+)
+```
+
+# 11. Visualizations Describing the Data
+
+## 11.1 Magnitude Distribution
+
+```{r magnitude-distribution-plot, fig.width=8, fig.height=5}
+ggplot(earthquakes_clean, aes(x = magnitude)) +
+  geom_histogram(binwidth = 0.1, boundary = 0, color = "white") +
+  labs(
+    title = "Distribution of Earthquake Magnitudes",
+    subtitle = paste0("USGS earthquakes from ", study_start, " to ", study_end, ", magnitude ", minimum_magnitude, "+"),
+    x = "Magnitude",
+    y = "Number of Earthquakes"
+  ) +
+  theme_minimal()
+```
+
+This plot describes the overall magnitude distribution and helps validate that most events in the study period are in the lower end of the selected magnitude range.
+
+## 11.2 Earthquake Count by Magnitude Category
+
+```{r magnitude-category-plot, fig.width=8, fig.height=5}
+ggplot(magnitude_category_summary, aes(x = magnitude_category, y = event_count)) +
+  geom_col() +
+  geom_text(aes(label = event_count), vjust = -0.3, size = 3.5) +
+  labs(
+    title = "Earthquake Events by Magnitude Category",
+    x = "Magnitude Category",
+    y = "Number of Earthquakes"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+## 11.3 Magnitude and Depth Relationship
+
+```{r magnitude-depth-scatter, fig.width=8, fig.height=5}
+ggplot(earthquakes_clean, aes(x = depth_km, y = magnitude)) +
+  geom_point(alpha = 0.45) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "Relationship Between Earthquake Depth and Magnitude",
+    x = "Depth (km)",
+    y = "Magnitude"
+  ) +
+  theme_minimal()
+```
+
+This scatterplot explores whether deeper earthquakes tend to have different magnitudes than shallower events. The trend line provides a simple visual check before formal statistical analysis.
+
+## 11.4 Top Countries by Earthquake Count
+
+```{r top-countries-count-plot, fig.width=9, fig.height=6}
+top_countries_by_count <- country_exposure %>%
+  slice_max(earthquake_count, n = 15) %>%
+  mutate(country = fct_reorder(country, earthquake_count))
+
+ggplot(top_countries_by_count, aes(x = earthquake_count, y = country)) +
+  geom_col() +
+  labs(
+    title = "Top Countries by Earthquake Event Count",
+    subtitle = "Country-level events matched using earthquake coordinates and country boundaries",
+    x = "Number of Earthquakes",
+    y = "Country"
+  ) +
+  theme_minimal()
+```
+
+This plot shows where earthquakes occurred most often, but it does not yet account for population exposure.
+
+# 12. Visualizations Supporting the Conclusion
+
+## 12.1 Top Countries by Custom Exposure Score
+
+```{r top-exposure-score-plot, fig.width=9, fig.height=6}
+top_countries_by_exposure <- country_exposure %>%
+  slice_max(exposure_score_0_100, n = 15) %>%
+  mutate(country = fct_reorder(country, exposure_score_0_100))
+
+ggplot(top_countries_by_exposure, aes(x = exposure_score_0_100, y = country)) +
+  geom_col() +
+  labs(
+    title = "Top Countries by Earthquake Exposure Score",
+    subtitle = "Score combines weighted seismic activity with a population exposure factor",
+    x = "Exposure Score (0-100)",
+    y = "Country"
+  ) +
+  theme_minimal()
+```
+
+This graphic supports the main conclusion because it ranks countries using both seismic activity and population exposure, not event count alone.
+
+## 12.2 Population and Weighted Seismic Activity
+
+```{r population-seismic-scatter, fig.width=8, fig.height=5}
+country_exposure %>%
+  filter(earthquake_count >= 3) %>%
+  ggplot(aes(x = population_millions, y = weighted_seismic_activity)) +
+  geom_point(aes(size = exposure_score_0_100), alpha = 0.65) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_x_log10(labels = scales::comma) +
+  labs(
+    title = "Population Size and Weighted Seismic Activity",
+    subtitle = "Countries with more events and larger populations can rank higher in exposure-based analysis",
+    x = "Population in Millions (log scale)",
+    y = "Weighted Seismic Activity",
+    size = "Exposure Score"
+  ) +
+  theme_minimal()
+```
+
+This scatterplot compares population size with weighted seismic activity. It helps show why exposure analysis can differ from a simple ranking by event count.
+
+## 12.3 Earthquakes per Million People
+
+```{r earthquakes-per-million-plot, fig.width=9, fig.height=6}
+top_per_million <- country_exposure %>%
+  filter(population_millions >= 1) %>%
+  slice_max(earthquakes_per_million, n = 15) %>%
+  mutate(country = fct_reorder(country, earthquakes_per_million))
+
+ggplot(top_per_million, aes(x = earthquakes_per_million, y = country)) +
+  geom_col() +
+  labs(
+    title = "Top Countries by Earthquakes per Million People",
+    subtitle = "Population-adjusted rate using countries with at least 1 million people",
+    x = "Earthquakes per Million People",
+    y = "Country"
+  ) +
+  theme_minimal()
+```
+
+This chart provides a population-adjusted view of earthquake activity. It is useful because countries with smaller populations can appear very different after adjustment.
+
+# 13. Feature Beyond Class: Static and Interactive Geospatial Mapping
+
+This project includes both a static world map and an interactive `leaflet` map as geospatial features beyond the standard course workflow. The static map provides a reliable visualization of global earthquake locations in the rendered report, while the interactive `leaflet` map allows the user to explore individual earthquake events by clicking on markers. Each marker includes event-level information such as magnitude, depth, date, place, and matched country when available.
+
+```{r prepare-map-data}
+leaflet_data <- earthquakes_with_country %>%
+  filter(!is.na(latitude), !is.na(longitude)) %>%
+  mutate(
+    popup_text = paste0(
+      "<strong>Magnitude:</strong> ", round(magnitude, 1), "<br>",
+      "<strong>Depth:</strong> ", round(depth_km, 1), " km<br>",
+      "<strong>Date:</strong> ", event_date, "<br>",
+      "<strong>Place:</strong> ", htmltools::htmlEscape(place), "<br>",
+      "<strong>Country:</strong> ",
+      ifelse(is.na(country), "Offshore/Unmatched", htmltools::htmlEscape(country))
+    )
+  )
+world_map <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+ggplot() +
+  geom_sf(data = world_map, fill = "gray95", color = "gray70", linewidth = 0.2) +
+  geom_point(
+    data = leaflet_data,
+    aes(x = longitude, y = latitude, size = magnitude),
+    alpha = 0.45
+  ) +
+  scale_size_continuous(range = c(1, 5)) +
+  coord_sf(expand = FALSE) +
+  labs(
+    title = "Global Earthquake Locations",
+    subtitle = paste0("USGS earthquakes from ", study_start, " to ", study_end, ", magnitude ", minimum_magnitude, "+"),
+    x = "Longitude",
+    y = "Latitude",
+    size = "Magnitude"
+  ) +
+  theme_minimal()
+leaflet(leaflet_data, height = 600) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addCircleMarkers(
+    lng = ~longitude,
+    lat = ~latitude,
+    radius = ~scales::rescale(magnitude, to = c(3, 9)),
+    stroke = FALSE,
+    fillOpacity = 0.55,
+    popup = ~popup_text,
+    label = ~paste0("M", round(magnitude, 1), " - ", place)
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    title = "Earthquakes M4.5+",
+    labels = c("Circle size increases with magnitude"),
+    colors = "gray40"
+  )
+```
+
+Together, the static and interactive maps support the geographic interpretation of the project by showing that earthquake activity is spatially clustered rather than evenly distributed across the world. The static map ensures that the location pattern is visible in the published report, while the interactive map provides an additional way to inspect event-level details.
+
+# 14. Statistical Analysis
+
+## 14.1 Correlation Analysis
+
+This section evaluates relationships among population size, earthquake count, weighted seismic activity, and the custom exposure score.
+
+```{r correlation-analysis}
+correlation_data <- country_exposure %>%
+  select(
+    population_millions,
+    earthquake_count,
+    avg_magnitude,
+    max_magnitude,
+    avg_depth_km,
+    weighted_seismic_activity,
+    earthquakes_per_million,
+    exposure_score_0_100
+  )
+
+correlation_results <- tibble(
+  comparison = c(
+    "Population vs Earthquake Count",
+    "Population vs Weighted Seismic Activity",
+    "Earthquake Count vs Exposure Score",
+    "Weighted Seismic Activity vs Exposure Score",
+    "Earthquakes per Million vs Exposure Score"
+  ),
+  correlation = c(
+    cor(correlation_data$population_millions, correlation_data$earthquake_count, use = "complete.obs"),
+    cor(correlation_data$population_millions, correlation_data$weighted_seismic_activity, use = "complete.obs"),
+    cor(correlation_data$earthquake_count, correlation_data$exposure_score_0_100, use = "complete.obs"),
+    cor(correlation_data$weighted_seismic_activity, correlation_data$exposure_score_0_100, use = "complete.obs"),
+    cor(correlation_data$earthquakes_per_million, correlation_data$exposure_score_0_100, use = "complete.obs")
+  )
+)
+
+knitr::kable(
+  correlation_results,
+  digits = 3,
+  caption = "Correlation analysis for earthquake exposure variables"
+)
+```
+
+The correlation analysis supports the project by testing whether the exposure score is more closely aligned with raw event frequency, weighted seismic activity, population-adjusted rates, or population size.
+
+## 14.2 Regression Model
+
+This regression model evaluates how population size, earthquake frequency, average magnitude, and average depth relate to the custom exposure index. The model uses a log transformation because exposure values are right-skewed.
+
+```{r regression-model}
+regression_data <- country_exposure %>%
+  filter(
+    earthquake_count >= 2,
+    population > 0,
+    raw_exposure_index > 0
+  ) %>%
+  mutate(
+    log_exposure_index = log1p(raw_exposure_index),
+    log_population = log10(population)
+  )
+
+exposure_model <- lm(
+  log_exposure_index ~ log_population + earthquake_count + avg_magnitude + avg_depth_km,
+  data = regression_data
+)
+
+model_summary <- broom::tidy(exposure_model)
+model_fit <- broom::glance(exposure_model)
+
+knitr::kable(
+  model_summary,
+  digits = 4,
+  caption = "Regression model coefficients for log exposure index"
+)
+
+knitr::kable(
+  model_fit %>% select(r.squared, adj.r.squared, sigma, statistic, p.value, df, nobs),
+  digits = 4,
+  caption = "Regression model fit statistics"
+)
+```
+
+The regression model provides statistical support for the conclusion by evaluating whether population and earthquake activity variables are associated with the exposure index.
+
+## 14.3 Comparing Event Count Ranking vs Exposure Score Ranking
+
+A key goal of the project is to show whether exposure analysis changes interpretation compared with simple earthquake counts. This section compares country rankings by earthquake count and by exposure score.
+
+```{r ranking-comparison}
+ranking_comparison <- country_exposure %>%
+  mutate(
+    count_rank = min_rank(desc(earthquake_count)),
+    exposure_rank = min_rank(desc(exposure_score_0_100)),
+    rank_change = count_rank - exposure_rank
+  ) %>%
+  arrange(exposure_rank) %>%
+  select(
+    country,
+    continent,
+    population_millions,
+    earthquake_count,
+    count_rank,
+    exposure_score_0_100,
+    exposure_rank,
+    rank_change
+  )
+
+knitr::kable(
+  ranking_comparison %>% head(20),
+  digits = 2,
+  caption = "Comparison of earthquake count ranking and exposure score ranking"
+)
+```
+
+A positive rank change means a country ranks higher under the exposure score than under simple earthquake count. This helps demonstrate how population exposure can change the interpretation of earthquake risk.
+
+# 15. Main Findings
+
+```{r main-findings-values}
+top_count_country <- country_exposure %>%
+  slice_max(earthquake_count, n = 1, with_ties = FALSE)
+
+top_exposure_country <- country_exposure %>%
+  slice_max(exposure_score_0_100, n = 1, with_ties = FALSE)
+
+top_per_million_country <- country_exposure %>%
+  filter(population_millions >= 1) %>%
+  slice_max(earthquakes_per_million, n = 1, with_ties = FALSE)
+
+summary_findings <- tibble(
+  finding = c(
+    "Highest earthquake count",
+    "Highest custom exposure score",
+    "Highest earthquakes per million people among countries with at least 1 million people"
+  ),
+  country = c(
+    top_count_country$country,
+    top_exposure_country$country,
+    top_per_million_country$country
+  ),
+  value = c(
+    round(top_count_country$earthquake_count, 2),
+    round(top_exposure_country$exposure_score_0_100, 2),
+    round(top_per_million_country$earthquakes_per_million, 2)
+  )
+)
+
+knitr::kable(
+  summary_findings,
+  caption = "Summary of main country-level findings"
+)
+```
+```{r dynamic-findings-text, results='asis'}
+cat(
+  "The country with the highest earthquake count in this study period was",
+  top_count_country$country,
+  "with",
+  top_count_country$earthquake_count,
+  "matched earthquake events. The country with the highest custom exposure score was",
+  top_exposure_country$country,
+  "with an exposure score of",
+  round(top_exposure_country$exposure_score_0_100, 2),
+  ". The highest earthquakes-per-million rate among countries with at least 1 million people was observed in",
+  top_per_million_country$country,
+  "with",
+  round(top_per_million_country$earthquakes_per_million, 2),
+  "earthquakes per million people. These differences show why population-adjusted and exposure-weighted analysis can change the interpretation of earthquake risk."
+)
+```
+
+The main finding is that earthquake risk interpretation changes depending on the metric used. Countries with the largest number of earthquakes are not always the same as countries with the highest population-adjusted rates or the highest exposure score. This supports the motivation for analyzing earthquake risk beyond magnitude and event count alone.
+
+# 16. Challenges Encountered
+
+One major challenge in this project was connecting earthquake events to countries. The USGS data provides latitude and longitude coordinates and a text place description, but the place field is not always a clean country name. Some events occur offshore, near islands, or in oceanic regions. To address this, the project used geospatial country boundaries from Natural Earth and assigned country information using a spatial join. Events that did not fall within a country boundary were treated as offshore or unmatched events and excluded from the country-population join.
+
+A second challenge was the structure of the World Bank population file. The raw CSV contains metadata rows before the table and stores years as separate columns. To solve this, the project skipped the metadata rows and transformed the population data from wide to long format before selecting the latest available year.
+
+# 17. Limitations
+
+This project uses country-level population as a broad exposure measure. This is useful for comparing countries, but it does not show the exact number of people near each earthquake epicenter. A more advanced version of this project could use gridded population density data to estimate people living within a specific radius of each earthquake.
+
+The custom exposure score is also an analytical index rather than a direct measure of damage, deaths, or economic loss. Actual earthquake impact depends on many factors not included here, such as building quality, emergency preparedness, time of day, local soil conditions, tsunami risk, and distance from population centers.
+
+Finally, offshore earthquakes are important for tsunami risk, but many are not assigned to a country through the spatial join. This analysis focuses mainly on country-level seismic exposure and population context.
+
+# 18. Conclusion
+
+This project shows that earthquake risk should be analyzed beyond magnitude alone. By combining USGS earthquake activity with World Bank population data, the analysis provides multiple ways to compare seismic exposure: raw event counts, population-adjusted rates, weighted seismic activity, and a custom exposure score.
+
+The results demonstrate that the interpretation of risk can change depending on whether population exposure is included. A country with many earthquakes may not have the highest population-adjusted exposure, while a highly populated country with fewer but stronger events may rank higher using an exposure-based score. This supports the main conclusion that population exposure adds important context to earthquake risk analysis.
+
+# 19. Reproducibility Notes
+
+This project is designed to be reproducible:
+
+-   The USGS earthquake data is acquired from a public API/GeoJSON query.
+-   The World Bank population CSV files are stored in the project GitHub repository.
+-   The World Bank data is loaded using raw GitHub URLs rather than local file paths.
+-   All cleaning, transformation, analysis, and visualization steps are performed in this Quarto document.
+-   The project avoids references to local OneDrive, Desktop, or Downloads paths.
+
+# 20. References and Data Source Links
+
+- USGS Earthquake Catalog API: `https://earthquake.usgs.gov/fdsnws/event/1/`
+- World Bank Population, total indicator (`SP.POP.TOTL`): `https://data.worldbank.org/indicator/SP.POP.TOTL`
+- Natural Earth country boundary data accessed through the `rnaturalearth` R package
+- R packages used: `tidyverse`, `jsonlite`, `lubridate`, `scales`, `sf`, `rnaturalearth`, `leaflet`, `broom`, `knitr`, `htmltools`, and `viridis`
