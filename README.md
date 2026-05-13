@@ -238,6 +238,10 @@ To reproduce the project:
 * **Codebase:**
   [https://github.com/suffyankhan77/Final_Project-DATA-607/blob/main/Final_Project_Codebase.qmd](https://github.com/suffyankhan77/Final_Project-DATA-607/blob/main/Final_Project_Codebase.qmd)
 
+* **Video Presentation:**
+  [https://drive.google.com/file/d/1eIr3ktfCgyw4h1PuCU561NzMJHPcF-NB/view?usp=drive_link]
+  
+
 ---
 
 ## Video Presentation
