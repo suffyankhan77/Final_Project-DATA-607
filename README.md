@@ -27,7 +27,6 @@ Final_Project-DATA-607/
 │
 ├── Final_Project_Codebase.qmd          # Main final project report, code, analysis, and conclusions
 ├── Final_Project_LLM_Transcript.pdf    # LLM usage transcript
-├── Final_Project_Video_Explainer.mp4   # Recorded final presentation / video explainer
 ├── README.md                           # Project documentation
 ├── .gitignore
 └── LICENSE
@@ -243,11 +242,12 @@ To reproduce the project:
 
 ## Video Presentation
 
-A recorded final project presentation will be included here:
+A recorded final project presentation was submitted through Brightspace.
 
-```text
-Final_Project_Video_Explainer.mp4
-```
+The video file was not uploaded directly to GitHub because the file size is larger than GitHub’s standard web upload limit. A Google Drive backup link is provided below:
+
+* **Video Presentation Link:**  
+  https://drive.google.com/file/d/1eIr3ktfCgyw4h1PuCU561NzMJHPcF-NB/view?usp=drive_link
 
 ---
 
